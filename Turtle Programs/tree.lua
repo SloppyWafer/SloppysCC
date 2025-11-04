@@ -48,7 +48,7 @@ local function farm()
     local xHome,yHome,zHome = gps.locate()
 
     if turtleOrientation[startingOrientaion] == "north" then
-        sMove.goTo(xHome,yHome-1,zHome+2)
+        sMove.goTo(xHome,yHome-1,zHome-2)
         chop()
         sMove.goTo(xHome,yHome,zHome)
         sMove.setOrientation(turtleOrientation[startingOrientaion])
@@ -60,7 +60,7 @@ local function farm()
         sMove.setOrientation(turtleOrientation[startingOrientaion])
         replant()
     elseif turtleOrientation[startingOrientaion] == "south" then
-        sMove.goTo(xHome,yHome-1,zHome-2)
+        sMove.goTo(xHome,yHome-1,zHome+2)
         chop()
         sMove.goTo(xHome,yHome,zHome)
         sMove.setOrientation(turtleOrientation[startingOrientaion])
