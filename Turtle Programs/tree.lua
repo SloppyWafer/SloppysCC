@@ -2,6 +2,7 @@ os.loadAPI("sMove.lua")
 term.clear()
 term.setCursorPos(1,1)
 print("Welcome Sloppy")
+print("Tree Farming...")
 
 local function deposit()
     for i=1,16 do
@@ -21,6 +22,8 @@ local function chop()
             turtle.up()
         end
         deposit()
+    else
+        turtle.up()
     end
 end
 
@@ -46,7 +49,7 @@ local function farm()
     local startingOrientaion = sMove.defineOrientation()
     local turtleOrientation = {"north", "east", "south", "west"}
     local xHome,yHome,zHome = gps.locate()
-
+    --print("facing: "..turtleOrientation[startingOrientaion])
     if turtleOrientation[startingOrientaion] == "north" then
         sMove.goTo(xHome,yHome-1,zHome-2)
         chop()
