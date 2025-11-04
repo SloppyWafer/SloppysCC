@@ -12,13 +12,16 @@ local function deposit()
 end
 
 local function chop()
-    turtle.dig()
-    turtle.forward()
-    while turtle.detectUp() do
-        turtle.digUp()
-        turtle.up()
+    local block,data = turtle.inspect()
+    if data.name == "minecraft:birch_log" then
+        turtle.dig()
+        turtle.forward()
+        while turtle.detectUp() do
+            turtle.digUp()
+            turtle.up()
+        end
+        deposit()
     end
-    deposit()
 end
 
 local function replant()
@@ -69,4 +72,9 @@ local function farm()
         sMove.setOrientation(turtleOrientation[startingOrientaion])
         replant()
     end
+end
+
+while true do
+    farm()
+    sleep(60)
 end
