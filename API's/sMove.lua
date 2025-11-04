@@ -50,7 +50,7 @@ function goTo(x,y,z)
       turtle.dig()
       turtle.forward()
       currentX,currentY,currentZ = gps.locate()
-      print("X > Correct")
+      --print("X > Correct")
     end
   elseif currentX < x then
     setOrientation("east")
@@ -58,7 +58,7 @@ function goTo(x,y,z)
       turtle.dig()
       turtle.forward()
       currentX,currentY,currentZ = gps.locate()
-      print("X < Correct")
+      --print("X < Correct")
     end
   end
   if currentZ > z then
@@ -67,7 +67,7 @@ function goTo(x,y,z)
       turtle.dig()
       turtle.forward()
       currentX,currentY,currentZ = gps.locate()
-      print("Z < Correct")
+      --print("Z < Correct")
     end
   elseif currentZ < z then
     setOrientation("south")
@@ -75,7 +75,7 @@ function goTo(x,y,z)
       turtle.dig()
       turtle.forward()
       currentX,currentY,currentZ = gps.locate()
-      print("Z > Correct")
+      --print("Z > Correct")
     end
   end
   if currentY > y then
@@ -83,14 +83,14 @@ function goTo(x,y,z)
       turtle.digDown()
       turtle.down()
       currentX,currentY,currentZ = gps.locate()
-      print("Y > Correct")
+      --print("Y > Correct")
     end
   elseif currentY < y then
     while currentY > y do
       turtle.digUp()
       turtle.up()
       currentX,currentY,currentZ = gps.locate()
-      print("Y < Correct")
+      --print("Y < Correct")
     end
   end
 end
