@@ -1,0 +1,1599 @@
+-- Turtle_Client.lua (v3.9.8)
+-- CC:Tweaked Client with Dynamic Fast-Return Routing & Optimized Point-to-Point Tree Farming
+
+local CLIENT_VERSION = "v3.9.8"
+local PROTOCOL = "turtle_tracker"
+local HOME_FILE = "home_pos.txt"
+local STATE_FILE = "mining_state.txt"
+local REQUIRED_SLOT = 16
+local REQUIRED_TAG = "enderchests:ender_chest"
+
+local modem = peripheral.find("modem")
+if not modem then error("Wireless Modem required on Turtle!") end
+rednet.open(peripheral.getName(modem))
+
+local currentStatus = "Idle"
+local pendingTask = nil
+local stopRequested = false
+local homeX, homeY, homeZ = nil, nil, nil
+local currentX, currentY, currentZ = nil, nil, nil
+local currentFacing = 0 -- 0: South (+Z), 1: West (-X), 2: North (-Z), 3: East (+X)
+local isFacingCalibrated = false
+local facingNames = { [0] = "South", [1] = "West", [2] = "North", [3] = "East" }
+
+local pathHistory = {}
+local isDepositing = false
+local isVeinMining = false
+local isBacktracking = false
+local isMiningTask = false
+local latestMasterVersion = nil
+local lowFuelTriggered = false
+
+local ALL_ORES = {
+    ["minecraft:coal_ore"]               = true, ["minecraft:deepslate_coal_ore"]       = true,
+    ["minecraft:copper_ore"]             = true, ["minecraft:deepslate_copper_ore"]     = true, ["minecraft:raw_copper_block"] = true,
+    ["minecraft:iron_ore"]               = true, ["minecraft:deepslate_iron_ore"]       = true, ["minecraft:raw_iron_block"]   = true,
+    ["minecraft:gold_ore"]               = true, ["minecraft:deepslate_gold_ore"]       = true, ["minecraft:raw_gold_block"]   = true,
+    ["minecraft:redstone_ore"]           = true, ["minecraft:deepslate_redstone_ore"]   = true,
+    ["minecraft:lapis_ore"]              = true, ["minecraft:deepslate_lapis_ore"]      = true,
+    ["minecraft:diamond_ore"]            = true, ["minecraft:deepslate_diamond_ore"]    = true,
+    ["minecraft:emerald_ore"]            = true, ["minecraft:deepslate_emerald_ore"]    = true,
+    ["minecraft:nether_quartz_ore"]      = true, ["minecraft:nether_gold_ore"]          = true, ["minecraft:ancient_debris"]   = true
+}
+
+local function getPosition()
+    if gps then
+        local x, y, z = gps.locate(2)
+        if x then
+            currentX, currentY, currentZ = math.floor(x), math.floor(y), math.floor(z)
+            return currentX, currentY, currentZ
+        end
+    end
+    return currentX, currentY, currentZ
+end
+
+local function recordPosition()
+    if isDepositing or isVeinMining or isBacktracking or not isMiningTask then return end
+    local x, y, z = getPosition()
+    if x and y and z then
+        local last = pathHistory[#pathHistory]
+        if not last or (last.x ~= x or last.y ~= y or last.z ~= z) then
+            table.insert(pathHistory, {x = x, y = y, z = z})
+        end
+    end
+end
+
+local function isEnderChest(slot)
+    local detail = turtle.getItemDetail(slot)
+    return detail and detail.name == REQUIRED_TAG
+end
+
+local function ensureEnderChestInSlot16()
+    if isEnderChest(REQUIRED_SLOT) then return true end
+    local foundSlot = nil
+    for i = 1, 15 do
+        if isEnderChest(i) then foundSlot = i break end
+    end
+    if not foundSlot then return false end
+
+    if turtle.getItemCount(REQUIRED_SLOT) > 0 then
+        for i = 1, 15 do
+            if i ~= foundSlot and turtle.getItemCount(i) == 0 then
+                turtle.select(REQUIRED_SLOT)
+                turtle.transferTo(i)
+                break
+            end
+        end
+    end
+
+    turtle.select(foundSlot)
+    turtle.transferTo(REQUIRED_SLOT)
+    turtle.select(1)
+    return isEnderChest(REQUIRED_SLOT)
+end
+
+local function depositInventory()
+    isDepositing = true
+    if not ensureEnderChestInSlot16() then
+        isDepositing = false
+        return false, "No Ender Chest"
+    end
+
+    if not turtle.up() then
+        turtle.digUp()
+        if not turtle.up() then
+            isDepositing = false
+            return false, "Blocked Above"
+        end
+    end
+
+    if turtle.detectDown() then turtle.digDown() end
+    turtle.select(REQUIRED_SLOT)
+    if not turtle.placeDown() then
+        turtle.down()
+        isDepositing = false
+        return false, "Placement Failed"
+    end
+
+    for i = 1, 15 do
+        if turtle.getItemCount(i) > 0 then
+            turtle.select(i)
+            turtle.dropDown()
+        end
+    end
+
+    turtle.select(1)
+    turtle.digDown()
+    ensureEnderChestInSlot16()
+    turtle.down()
+    isDepositing = false
+    return true
+end
+
+local function refuelAll()
+    for i = 1, 15 do
+        turtle.select(i)
+        if turtle.refuel(0) then
+            turtle.refuel()
+        end
+    end
+    turtle.select(1)
+    if turtle.getFuelLevel() == "unlimited" or turtle.getFuelLevel() > 200 then
+        lowFuelTriggered = false
+    end
+end
+
+local function saveHome(x, y, z)
+    homeX, homeY, homeZ = math.floor(x), math.floor(y), math.floor(z)
+    local file = fs.open(HOME_FILE, "w")
+    if file then
+        file.write(textutils.serialize({ x = homeX, y = homeY, z = homeZ }))
+        file.close()
+    end
+end
+
+local function loadHome()
+    if fs.exists(HOME_FILE) then
+        local file = fs.open(HOME_FILE, "r")
+        if file then
+            local data = textutils.unserialize(file.readAll())
+            file.close()
+            if data and data.x and data.y and data.z then
+                homeX, homeY, homeZ = tonumber(data.x), tonumber(data.y), tonumber(data.z)
+            end
+        end
+    end
+end
+
+local function saveMiningState(stateData)
+    local file = fs.open(STATE_FILE, "w")
+    if file then
+        file.write(textutils.serialize(stateData))
+        file.close()
+    end
+end
+
+local function loadMiningState()
+    if fs.exists(STATE_FILE) then
+        local file = fs.open(STATE_FILE, "r")
+        if file then
+            local data = textutils.unserialize(file.readAll())
+            file.close()
+            return data
+        end
+    end
+    return nil
+end
+
+local function clearMiningState()
+    if fs.exists(STATE_FILE) then
+        fs.delete(STATE_FILE)
+    end
+end
+
+local function tryRefuel()
+    if turtle.getFuelLevel() == "unlimited" then
+        lowFuelTriggered = false
+        return true
+    end
+    
+    if turtle.getFuelLevel() < 100 then
+        local originalSlot = turtle.getSelectedSlot()
+        for i = 1, 15 do
+            if turtle.getItemCount(i) > 0 then
+                turtle.select(i)
+                if turtle.refuel(0) then
+                    turtle.refuel(64)
+                    if turtle.getFuelLevel() > 200 then break end
+                end
+            end
+        end
+        turtle.select(originalSlot)
+    end
+
+    if turtle.getFuelLevel() > 200 then
+        lowFuelTriggered = false
+    end
+    return turtle.getFuelLevel() > 50
+end
+
+local function safeDown()
+    if stopRequested then return false end
+    local attempts = 0
+    while turtle.detectDown() and attempts < 10 do
+        if stopRequested then return false end
+        turtle.digDown()
+        sleep(0.4)
+        attempts = attempts + 1
+    end
+    local moved = turtle.down()
+    if moved then
+        if currentY then currentY = currentY - 1 end
+        recordPosition()
+    end
+    return moved
+end
+
+local function safeUp()
+    if stopRequested then return false end
+    local attempts = 0
+    while turtle.detectUp() and attempts < 10 do
+        if stopRequested then return false end
+        turtle.digUp()
+        sleep(0.4)
+        attempts = attempts + 1
+    end
+    local moved = turtle.up()
+    if moved then
+        if currentY then currentY = currentY + 1 end
+        recordPosition()
+    end
+    return moved
+end
+
+local function safeForward()
+    if stopRequested then return false end
+    local attempts = 0
+    while turtle.detect() and attempts < 10 do
+        if stopRequested then return false end
+        turtle.dig()
+        sleep(0.4)
+        attempts = attempts + 1
+    end
+    local moved = turtle.forward()
+    if moved then
+        if currentX and currentZ then
+            if currentFacing == 0 then currentZ = currentZ + 1
+            elseif currentFacing == 1 then currentX = currentX - 1
+            elseif currentFacing == 2 then currentZ = currentZ - 1
+            elseif currentFacing == 3 then currentX = currentX + 1 end
+        end
+        recordPosition()
+    end
+    return moved
+end
+
+local function safeBack()
+    if stopRequested then return false end
+    local moved = turtle.back()
+    if moved then
+        if currentX and currentZ then
+            if currentFacing == 0 then currentZ = currentZ - 1
+            elseif currentFacing == 1 then currentX = currentX + 1
+            elseif currentFacing == 2 then currentZ = currentZ + 1
+            elseif currentFacing == 3 then currentX = currentX - 1 end
+        end
+        recordPosition()
+    end
+    return moved
+end
+
+local function turnTo(targetFacing)
+    while currentFacing ~= targetFacing do
+        turtle.turnRight()
+        currentFacing = (currentFacing + 1) % 4
+    end
+end
+
+local function calibrateFacing()
+    if isFacingCalibrated then return true end
+    local x1, y1, z1 = getPosition()
+    if not x1 then return false end
+
+    for i = 1, 4 do
+        if not turtle.detect() then
+            tryRefuel()
+            if turtle.forward() then
+                local x2, y2, z2 = getPosition()
+                turtle.back()
+                if x2 > x1 then currentFacing = 3
+                elseif x2 < x1 then currentFacing = 1
+                elseif z2 > z1 then currentFacing = 0
+                elseif z2 < z1 then currentFacing = 2 end
+                isFacingCalibrated = true
+                return true
+            end
+        end
+        turtle.turnRight()
+        currentFacing = (currentFacing + 1) % 4
+    end
+    return false
+end
+
+local function tryMoveStep(dir)
+    if stopRequested then return false end
+    if dir == 4 then return safeUp()
+    elseif dir == 5 then return safeDown()
+    else
+        turnTo(dir)
+        return safeForward()
+    end
+end
+
+local function getFreeInventorySlots()
+    if turtle.getItemCount(15) == 0 then
+        return 2
+    end
+    local free = 0
+    for i = 1, 15 do
+        if turtle.getItemCount(i) == 0 then free = free + 1 end
+    end
+    return free
+end
+
+local function isFuelCriticallyLow()
+    local level = turtle.getFuelLevel()
+    if level == "unlimited" then return false end
+    local limit = turtle.getFuelLimit()
+    local threshold = math.ceil(limit * 0.005)
+    return level <= threshold
+end
+
+local function isAtHome()
+    local x, y, z = getPosition()
+    if x and homeX and homeY and homeZ then
+        return x == homeX and y == homeY and z == homeZ
+    end
+    return false
+end
+
+local function checkFuelSafety()
+    tryRefuel()
+    if turtle.getFuelLevel() == "unlimited" then return true end
+
+    if isFuelCriticallyLow() then
+        lowFuelTriggered = true
+        return false
+    end
+
+    local x, y, z = getPosition()
+    if x and homeX and homeY and homeZ then
+        local dist = math.abs(x - homeX) + math.abs(y - homeY) + math.abs(z - homeZ)
+        local requiredFuel = math.ceil(dist * 1.5)
+        if turtle.getFuelLevel() <= requiredFuel then
+            lowFuelTriggered = true
+            return false
+        end
+    end
+
+    return true
+end
+
+local function goTo(targetX, targetY, targetZ)
+    if not targetX or not targetY or not targetZ or stopRequested then return false end
+    if not isFacingCalibrated then calibrateFacing() end
+    local attempts = 0
+    while attempts < 600 do
+        if stopRequested then return false end
+        local x, y, z = getPosition()
+        if not x or (x == targetX and y == targetY and z == targetZ) then break end
+        attempts = attempts + 1
+        local moved = false
+
+        if y < targetY then moved = tryMoveStep(4)
+        elseif x ~= targetX then moved = tryMoveStep((targetX > x) and 3 or 1)
+        elseif z ~= targetZ then moved = tryMoveStep((targetZ > z) and 0 or 2)
+        elseif y > targetY then moved = tryMoveStep(5) end
+
+        if not moved then moved = tryMoveStep(4) end
+        if not moved then break end
+    end
+    local fx, fy, fz = getPosition()
+    return fx and fx == targetX and fy == targetY and fz == targetZ
+end
+
+local function backtrackHome()
+    currentStatus = "Backtracking Home"
+    isBacktracking = true
+    stopRequested = false
+
+    if not isFacingCalibrated then calibrateFacing() end
+
+    while #pathHistory > 0 do
+        if stopRequested then
+            isBacktracking = false
+            pathHistory = {}
+            return false
+        end
+
+        local target = table.remove(pathHistory)
+        local cx, cy, cz = getPosition()
+
+        if cx and cy and cz then
+            local stepAttempts = 0
+            while (cx ~= target.x or cy ~= target.y or cz ~= target.z) and stepAttempts < 10 do
+                if stopRequested then
+                    isBacktracking = false
+                    pathHistory = {}
+                    return false
+                end
+
+                stepAttempts = stepAttempts + 1
+                local moved = false
+                if cy < target.y then
+                    moved = safeUp()
+                elseif cy > target.y then
+                    moved = safeDown()
+                elseif cx ~= target.x or cz ~= target.z then
+                    local targetFacing = nil
+                    if target.x > cx then targetFacing = 3
+                    elseif target.x < cx then targetFacing = 1
+                    elseif target.z > cz then targetFacing = 0
+                    elseif target.z < cz then targetFacing = 2 end
+
+                    if targetFacing ~= nil then
+                        turnTo(targetFacing)
+                        moved = safeForward()
+                    end
+                end
+                if not moved then break end
+                cx, cy, cz = getPosition()
+            end
+        end
+    end
+
+    isBacktracking = false
+    pathHistory = {}
+
+    if homeX and homeY and homeZ then
+        local fx, fy, fz = getPosition()
+        if not (fx == homeX and fy == homeY and fz == homeZ) then
+            return goTo(homeX, homeY, homeZ)
+        end
+    end
+    return true
+end
+
+local function getFacingVector(f)
+    if f == 0 then return 0, 0, 1
+    elseif f == 1 then return -1, 0, 0
+    elseif f == 2 then return 0, 0, -1
+    elseif f == 3 then return 1, 0, 0 end
+    return 0, 0, 0
+end
+
+local function scanAndClear3DVein(targetTable, minX, maxX, minZ, maxZ)
+    isVeinMining = true
+    local startX, startY, startZ = getPosition()
+    local startFacing = currentFacing
+    if not startX then isVeinMining = false return end
+
+    local visited = {}
+    local queue = {}
+
+    local function checkAndEnqueue(x, y, z)
+        if minX and (x < minX or x > maxX or z < minZ or z > maxZ) then return end
+        local key = x .. "," .. y .. "," .. z
+        if not visited[key] then
+            visited[key] = true
+            table.insert(queue, {x = x, y = y, z = z})
+        end
+    end
+
+    visited[startX .. "," .. startY .. "," .. startZ] = true
+
+    local function scanSurroundings()
+        local cx, cy, cz = getPosition()
+        if not cx then return end
+
+        local hasUp, uData = turtle.inspectUp()
+        if hasUp and targetTable[uData.name] then checkAndEnqueue(cx, cy + 1, cz) end
+
+        local hasDown, dData = turtle.inspectDown()
+        if hasDown and targetTable[dData.name] then checkAndEnqueue(cx, cy - 1, cz) end
+
+        for i = 0, 3 do
+            turnTo(i)
+            local dx, dy, dz = getFacingVector(i)
+            local hasFwd, fData = turtle.inspect()
+            if hasFwd and targetTable[fData.name] then checkAndEnqueue(cx + dx, cy, cz + dz) end
+        end
+    end
+
+    scanSurroundings()
+
+    while #queue > 0 and not stopRequested do
+        if getFreeInventorySlots() <= 1 or not checkFuelSafety() then break end
+        local target = table.remove(queue, 1)
+        if goTo(target.x, target.y, target.z) then
+            scanSurroundings()
+        end
+    end
+
+    if startX then
+        goTo(startX, startY, startZ)
+        turnTo(startFacing)
+    end
+    isVeinMining = false
+end
+
+local function inspectWallAndTunnelOres(targetTable)
+    local hasUp, uData = turtle.inspectUp()
+    if hasUp and targetTable[uData.name] then return true end
+
+    local hasDown, dData = turtle.inspectDown()
+    if hasDown and targetTable[dData.name] then return true end
+
+    local hasFwd, fData = turtle.inspect()
+    if hasFwd and targetTable[fData.name] then return true end
+
+    turtle.turnLeft()
+    currentFacing = (currentFacing - 1) % 4
+    local hasLeft, lData = turtle.inspect()
+    turtle.turnRight()
+    currentFacing = (currentFacing + 1) % 4
+    if hasLeft and targetTable[lData.name] then return true end
+
+    turtle.turnRight()
+    currentFacing = (currentFacing + 1) % 4
+    local hasRight, rData = turtle.inspect()
+    turtle.turnLeft()
+    currentFacing = (currentFacing - 1) % 4
+    if hasRight and targetTable[rData.name] then return true end
+
+    return false
+end
+
+local function checkVersionState()
+    if currentStatus == "Idle" or currentStatus == "At Home" or currentStatus == "Outdated Version" or currentStatus == "Low Fuel" then
+        if lowFuelTriggered or isFuelCriticallyLow() then
+            currentStatus = "Low Fuel"
+        elseif latestMasterVersion and latestMasterVersion ~= CLIENT_VERSION then
+            currentStatus = "Outdated Version"
+        elseif currentStatus == "Outdated Version" or currentStatus == "Low Fuel" then
+            currentStatus = "Idle"
+        end
+    end
+end
+
+local function returnHomeSequence(fromMining)
+    stopRequested = false
+    ensureEnderChestInSlot16()
+
+    local success = false
+    local cx, cy, cz = getPosition()
+
+    if fromMining and #pathHistory > 0 and cx and homeX and homeY and homeZ then
+        local backtrackCost = #pathHistory
+        local directDist = math.abs(cx - homeX) + math.abs(cy - homeY) + math.abs(cz - homeZ)
+
+        if (directDist * 2) < backtrackCost then
+            currentStatus = "Navigating Home (Direct)"
+            success = goTo(homeX, homeY, homeZ)
+        else
+            success = backtrackHome()
+        end
+    elseif fromMining and #pathHistory > 0 then
+        success = backtrackHome()
+    else
+        currentStatus = "Navigating Home"
+        if homeX and homeY and homeZ then
+            success = goTo(homeX, homeY, homeZ)
+        else
+            success = true
+        end
+    end
+
+    pathHistory = {}
+
+    if success then
+        currentStatus = "Depositing Items"
+        depositInventory()
+        if lowFuelTriggered or isFuelCriticallyLow() then
+            currentStatus = "Low Fuel"
+        else
+            currentStatus = "At Home"
+        end
+        checkVersionState()
+    else
+        currentStatus = "Nav Stuck"
+    end
+end
+
+local function executeChosenChunkMiningTask(topY, bottomY, strategy)
+    topY = topY or 48
+    bottomY = bottomY or -58
+    strategy = strategy or "ore"
+
+    if bottomY > topY then
+        topY, bottomY = bottomY, topY
+    end
+
+    if not isFacingCalibrated then calibrateFacing() end
+    local startX, startY, startZ = getPosition()
+    if not startX then currentStatus = "Error: No GPS" return end
+    if not homeX then saveHome(startX, startY, startZ) end
+
+    local savedState = loadMiningState()
+    local resumeY, resumeStripIdx, resumeX, resumeZ, resumeForwardZ = nil, nil, nil, nil, nil
+
+    if savedState then
+        topY = savedState.topY or topY
+        bottomY = savedState.bottomY or bottomY
+        strategy = savedState.strategy or strategy
+        resumeY = savedState.resumeY
+        resumeStripIdx = savedState.resumeStripIdx
+        resumeX = savedState.resumeX
+        resumeZ = savedState.resumeZ
+        resumeForwardZ = savedState.forwardZ
+        currentStatus = "Resuming Mining Position"
+        if savedState.posX and savedState.posY and savedState.posZ then
+            goTo(savedState.posX, savedState.posY, savedState.posZ)
+        end
+    else
+        currentStatus = "Navigating to Y=" .. topY
+        local x, y, z = getPosition()
+        while y ~= topY and not stopRequested do
+            if not checkFuelSafety() then lowFuelTriggered = true currentStatus = "Low Fuel! Ret. Home" break end
+            if y < topY then
+                if safeUp() then y = y + 1 else break end
+            else
+                if safeDown() then y = y - 1 else break end
+            end
+        end
+    end
+
+    local minX = math.floor(startX / 16) * 16
+    local maxX = minX + 15
+    local minZ = math.floor(startZ / 16) * 16
+    local maxZ = minZ + 15
+
+    local lastY, lastStripIdx, lastX, lastZ, lastForwardZ = topY, 1, minX, minZ, true
+
+    if strategy == "ore" then
+        local xStrips = { minX + 1, minX + 4, minX + 7, minX + 10, minX + 13 }
+        local startYLoop = resumeY or topY
+
+        for currentY = startYLoop, bottomY, -3 do
+            if stopRequested or lowFuelTriggered then break end
+
+            currentStatus = "Strip Y=" .. currentY
+            local startStrip = (resumeY and currentY == resumeY and resumeStripIdx) and resumeStripIdx or 1
+
+            for stripIdx = startStrip, #xStrips do
+                local targetX = xStrips[stripIdx]
+                if stopRequested or lowFuelTriggered then break end
+
+                local zStart = (stripIdx % 2 == 1) and minZ or maxZ
+                local zEnd = (stripIdx % 2 == 1) and maxZ or minZ
+                local zStep = (stripIdx % 2 == 1) and 1 or -1
+
+                local actualZStart = (resumeY and currentY == resumeY and resumeStripIdx and stripIdx == resumeStripIdx and resumeZ) and resumeZ or zStart
+
+                goTo(targetX, currentY, actualZStart)
+
+                for targetZ = actualZStart, zEnd, zStep do
+                    if stopRequested then break end
+
+                    lastY, lastStripIdx, lastX, lastZ = currentY, stripIdx, targetX, targetZ
+
+                    if not checkFuelSafety() then
+                        lowFuelTriggered = true
+                        currentStatus = "Low Fuel! Ret. Home"
+                        break
+                    end
+
+                    if getFreeInventorySlots() <= 1 then
+                        currentStatus = "Depositing Items"
+                        depositInventory()
+                        currentStatus = "Strip Y=" .. currentY
+                    end
+
+                    goTo(targetX, currentY, targetZ)
+
+                    if inspectWallAndTunnelOres(ALL_ORES) then
+                        scanAndClear3DVein(ALL_ORES, minX, maxX, minZ, maxZ)
+                    end
+                end
+                if lowFuelTriggered then break end
+            end
+            if lowFuelTriggered then break end
+        end
+    else
+        local startYLoop = resumeY or topY
+
+        for currentY = startYLoop, bottomY, -1 do
+            if stopRequested or lowFuelTriggered then break end
+
+            currentStatus = "Full Clear Y=" .. currentY
+            local forwardZ = (resumeY and currentY == resumeY and resumeForwardZ ~= nil) and resumeForwardZ or true
+            local startXVal = (resumeY and currentY == resumeY and resumeX) and resumeX or minX
+
+            for targetX = startXVal, maxX do
+                if stopRequested or lowFuelTriggered then break end
+
+                local zStart = forwardZ and minZ or maxZ
+                local zEnd = forwardZ and maxZ or minZ
+                local zStep = forwardZ and 1 or -1
+
+                local actualZStart = (resumeY and currentY == resumeY and resumeX and targetX == resumeX and resumeZ) and resumeZ or zStart
+
+                goTo(targetX, currentY, actualZStart)
+
+                for targetZ = actualZStart, zEnd, zStep do
+                    if stopRequested then break end
+
+                    lastY, lastX, lastZ, lastForwardZ = currentY, targetX, targetZ, forwardZ
+
+                    if not checkFuelSafety() then
+                        lowFuelTriggered = true
+                        currentStatus = "Low Fuel! Ret. Home"
+                        break
+                    end
+
+                    if getFreeInventorySlots() <= 1 then
+                        currentStatus = "Depositing Items"
+                        depositInventory()
+                        currentStatus = "Full Clear Y=" .. currentY
+                    end
+
+                    goTo(targetX, currentY, targetZ)
+                end
+                forwardZ = not forwardZ
+                if lowFuelTriggered then break end
+            end
+            if lowFuelTriggered then break end
+        end
+    end
+
+    if lowFuelTriggered then
+        local cx, cy, cz = getPosition()
+        saveMiningState({
+            topY = topY, bottomY = bottomY, strategy = strategy,
+            resumeY = lastY, resumeStripIdx = lastStripIdx,
+            resumeX = lastX, resumeZ = lastZ,
+            forwardZ = lastForwardZ,
+            posX = cx, posY = cy, posZ = cz
+        })
+    else
+        clearMiningState()
+    end
+end
+
+local function executeWheatFarmTask()
+    if not isFacingCalibrated then calibrateFacing() end
+    local startX, startY, startZ = getPosition()
+    if not startX then currentStatus = "Error: No GPS" return end
+    if not homeX then saveHome(startX, startY, startZ) end
+
+    -- Strictly stay within chunk boundaries (9x9 hydrated farm centered in the chunk)
+    local minX = math.floor(startX / 16) * 16
+    local minZ = math.floor(startZ / 16) * 16
+    local farmY = homeY + 1
+
+    local farmMinX, farmMaxX = minX + 3, minX + 11
+    local farmMinZ, farmMaxZ = minZ + 3, minZ + 11
+    local centerX, centerZ = minX + 7, minZ + 7 -- Water source block location
+
+    local function isBufferChest(name)
+        return (name:find("chest") and not name:find("ender")) or name:find("barrel")
+    end
+
+    -- ==========================================
+    -- INITIAL BOOT CHECK & INVENTORY ORGANIZER
+    -- ==========================================
+    local function checkAndOrganizeEquipment()
+        -- 1. Restore Default Tool (Pickaxe on Right, Crafting Table in 15)
+        local item15 = turtle.getItemDetail(15)
+        if not (item15 and item15.name == "minecraft:crafting_table") then
+            turtle.select(15)
+            turtle.equipRight()
+            local swappedItem = turtle.getItemDetail(15)
+            if not (swappedItem and swappedItem.name == "minecraft:crafting_table") then
+                turtle.equipRight() -- Wasn't the table, put the tool back
+            end
+        end
+
+        -- 2. Organize Hoe into Slot 11
+        local item11 = turtle.getItemDetail(11)
+        if not (item11 and item11.name:find("hoe")) then
+            -- Check if the turtle crashed mid-till and the hoe is on the right arm
+            turtle.select(11)
+            turtle.equipRight()
+            local swapped11 = turtle.getItemDetail(11)
+            if not (swapped11 and swapped11.name:find("hoe")) then
+                turtle.equipRight() -- Put the pickaxe back on the arm
+                
+                -- Look for the hoe in the rest of the inventory
+                for i = 1, 16 do
+                    if i ~= 11 and i ~= 12 and i ~= 13 and i ~= 14 and i ~= 15 and i ~= 16 then
+                        local item = turtle.getItemDetail(i)
+                        if item and item.name:find("hoe") then
+                            turtle.select(i)
+                            turtle.transferTo(11)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
+        -- 3. Organize Buffer Chest into Slot 12
+        local item12 = turtle.getItemDetail(12)
+        if not (item12 and isBufferChest(item12.name)) then
+            for i = 1, 16 do
+                if i ~= 11 and i ~= 12 and i ~= 13 and i ~= 14 and i ~= 15 and i ~= 16 then
+                    local item = turtle.getItemDetail(i)
+                    if item and isBufferChest(item.name) then
+                        turtle.select(i)
+                        turtle.transferTo(12)
+                        break
+                    end
+                end
+            end
+        end
+
+        -- 4. Consolidate Seeds into Slots 13 and 14
+        for i = 1, 16 do
+            if i ~= 11 and i ~= 12 and i ~= 13 and i ~= 14 and i ~= 15 and i ~= 16 then
+                local item = turtle.getItemDetail(i)
+                if item and item.name == "minecraft:wheat_seeds" then
+                    turtle.select(i)
+                    if not turtle.transferTo(13) then
+                        turtle.transferTo(14)
+                    end
+                end
+            end
+        end
+
+        -- 5. Move Crafting Table into Slot 15 (if loose)
+        local item15Check = turtle.getItemDetail(15)
+        if not (item15Check and item15Check.name == "minecraft:crafting_table") then
+            for i = 1, 16 do
+                if i ~= 11 and i ~= 12 and i ~= 13 and i ~= 14 and i ~= 15 and i ~= 16 then
+                    local item = turtle.getItemDetail(i)
+                    if item and item.name == "minecraft:crafting_table" then
+                        turtle.select(i)
+                        turtle.transferTo(15)
+                        break
+                    end
+                end
+            end
+        end
+
+        -- Verification
+        local hasHoe = turtle.getItemDetail(11) and turtle.getItemDetail(11).name:find("hoe")
+        local hasChest = turtle.getItemDetail(12) and isBufferChest(turtle.getItemDetail(12).name)
+        local seedCount = (turtle.getItemCount(13) or 0) + (turtle.getItemCount(14) or 0)
+        local hasCraft = turtle.getItemDetail(15) and turtle.getItemDetail(15).name == "minecraft:crafting_table"
+
+        turtle.select(1)
+
+        if not hasHoe then return false, "Need Hoe in Slot 11" end
+        if not hasChest then return false, "Need Chest in Slot 12" end
+        if seedCount < 10 then return false, "Need Seeds in S13/S14" end
+        if not hasCraft then return false, "Need Crafting Table (S15)" end
+
+        return true, "OK"
+    end
+
+    while not stopRequested do
+        local isReady, statusMsg = checkAndOrganizeEquipment()
+        if isReady then break end
+        currentStatus = statusMsg
+        sleep(5)
+    end
+
+    -- ==========================================
+    -- FARMING LOOP
+    -- ==========================================
+    while not stopRequested do
+        currentStatus = "Farming Wheat"
+        local forwardZ = true
+
+        for x = farmMinX, farmMaxX do
+            if stopRequested or lowFuelTriggered then break end
+
+            local zStart, zEnd, zStep = farmMinZ, farmMaxZ, 1
+            if not forwardZ then zStart, zEnd, zStep = farmMaxZ, farmMinZ, -1 end
+
+            for z = zStart, zEnd, zStep do
+                if stopRequested or lowFuelTriggered then break end
+                if not checkFuelSafety() then
+                    lowFuelTriggered = true
+                    currentStatus = "Low Fuel! Ret. Home"
+                    break
+                end
+
+                goTo(x, farmY, z)
+
+                -- Skip tilling/harvesting directly over the center water source block
+                if not (x == centerX and z == centerZ) then
+                    local hasDown, downData = turtle.inspectDown()
+
+                    -- 1. Till dirt/grass if un-tilled
+                    if not hasDown or downData.name == "minecraft:dirt" or downData.name == "minecraft:grass_block" then
+                        turtle.select(11)
+                        turtle.equipRight() -- Temporarily equip Hoe
+                        turtle.digDown()    -- Till farmland
+                        turtle.select(11)
+                        turtle.equipRight() -- Swap Pickaxe back to default
+                    end
+
+                    -- 2. Harvest fully grown wheat (age 7) using Pickaxe
+                    if hasDown and downData.name == "minecraft:wheat" and downData.state and downData.state.age == 7 then
+                        turtle.digDown()
+                    end
+
+                    -- 3. Plant seeds down from Slot 13 or 14
+                    local hasD, _ = turtle.inspectDown()
+                    if not hasD then
+                        for _, sSlot in ipairs({13, 14}) do
+                            if turtle.getItemCount(sSlot) > 0 then
+                                turtle.select(sSlot)
+                                turtle.placeDown()
+                                turtle.select(1)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            forwardZ = not forwardZ
+        end
+
+        if stopRequested or lowFuelTriggered then break end
+
+        -- ==========================================
+        -- BREAD CRAFTING & DEPOSIT LOGIC
+        -- ==========================================
+        currentStatus = "Returning Home"
+        goTo(homeX, farmY, homeZ)
+        goTo(homeX, homeY, homeZ)
+        turnTo(0)
+
+        currentStatus = "Crafting Bread"
+
+        -- 1. Place Buffer Chest from Slot 12 above
+        turtle.select(12)
+        turtle.placeUp()
+
+        -- 2. Equip Crafting Table to RIGHT side FIRST
+        -- This safely moves the Pickaxe off the arm and into Slot 15
+        turtle.select(15)
+        turtle.equipRight()
+
+        -- 3. NOW save the names of the tools so we can find them during suckUp
+        local hoeItem = turtle.getItemDetail(11)
+        local savedHoeName = hoeItem and hoeItem.name or ""
+        
+        local pickaxeItem = turtle.getItemDetail(15)
+        local savedPickaxeName = pickaxeItem and pickaxeItem.name or ""
+        
+        local enderItem = turtle.getItemDetail(16)
+        local savedEnderName = enderItem and enderItem.name or ""
+
+        -- 4. Dump entire inventory into the top buffer chest for a clean slate
+        for i = 1, 16 do
+            if turtle.getItemCount(i) > 0 then
+                turtle.select(i)
+                turtle.dropUp()
+            end
+        end
+
+        -- 5. Process stacks stack-by-stack
+        currentStatus = "Processing Wheat"
+        turtle.select(1)
+
+        while turtle.suckUp() do
+            local item = turtle.getItemDetail(1)
+            if item then
+                if item.name == "minecraft:wheat" then
+                    local count = item.count
+                    if count >= 3 then
+                        local third = math.floor(count / 3)
+                        -- Divide wheat evenly into 3 crafting grid slots (1, 2, 3)
+                        turtle.select(1)
+                        turtle.transferTo(2, third)
+                        turtle.transferTo(3, third)
+                        
+                        -- Craft bread into output slot 8
+                        turtle.select(8)
+                        turtle.craft()
+                        
+                        -- Deposit crafted bread into collection chest below
+                        if turtle.getItemCount(8) > 0 then
+                            turtle.dropDown()
+                        end
+
+                        -- Consolidate leftover wheat back to slot 1
+                        for _, wSlot in ipairs({2, 3}) do
+                            if turtle.getItemCount(wSlot) > 0 then
+                                turtle.select(wSlot)
+                                turtle.transferTo(1)
+                            end
+                        end
+                    end
+                    
+                    -- Move any leftover wheat (or stacks < 3) to buffer slots 2-10
+                    turtle.select(1)
+                    if turtle.getItemCount(1) > 0 then
+                        for s = 2, 10 do
+                            if turtle.getItemCount(s) == 0 or (turtle.getItemDetail(s).name == "minecraft:wheat" and turtle.getItemCount(s) < 64) then
+                                turtle.transferTo(s)
+                                if turtle.getItemCount(1) == 0 then break end
+                            end
+                        end
+                        -- Failsafe: if buffers are somehow completely full, drop the rest
+                        if turtle.getItemCount(1) > 0 then turtle.dropDown() end
+                    end
+                    turtle.select(1)
+
+                -- 5b. Route saved tools back to their assigned slots
+                elseif savedHoeName ~= "" and item.name == savedHoeName then
+                    turtle.transferTo(11)
+                    turtle.select(1)
+
+                elseif savedPickaxeName ~= "" and item.name == savedPickaxeName then
+                    turtle.transferTo(15)
+                    turtle.select(1)
+
+                elseif savedEnderName ~= "" and item.name == savedEnderName then
+                    turtle.transferTo(16)
+                    turtle.select(1)
+
+                else
+                    -- Buffer seeds/apples in middle slots
+                    for s = 2, 10 do
+                        if turtle.getItemCount(s) == 0 or (turtle.getItemDetail(s).name == item.name and turtle.getItemCount(s) < 64) then
+                            turtle.transferTo(s)
+                            if turtle.getItemCount(1) == 0 then break end
+                        end
+                    end
+                    if turtle.getItemCount(1) > 0 then turtle.dropDown() end
+                    turtle.select(1)
+                end
+            end
+        end
+
+        -- 6. Re-equip Pickaxe to RIGHT side (Crafting table returns to Slot 15)
+        turtle.select(15)
+        turtle.equipRight()
+
+        -- 7. Mine Buffer Chest back into Slot 12 (Uses default Pickaxe)
+        turtle.select(12)
+        turtle.digUp()
+
+        -- 8. Reorganize designated slots (Chest to 12, Seeds to 13 & 14)
+        currentStatus = "Organizing Slots"
+        for i = 1, 10 do
+            local item = turtle.getItemDetail(i)
+            if item and item.name == "minecraft:wheat_seeds" then
+                turtle.select(i)
+                if not turtle.transferTo(13) then
+                    turtle.transferTo(14)
+                end
+            end
+        end
+
+        local cItem = turtle.getItemDetail(12)
+        if not (cItem and isBufferChest(cItem.name)) then
+            for i = 1, 10 do
+                local item = turtle.getItemDetail(i)
+                if item and isBufferChest(item.name) then
+                    turtle.select(i)
+                    turtle.transferTo(12)
+                    break
+                end
+            end
+        end
+
+        -- 9. Deposit surplus seeds and bread to bottom chest (KEEP WHEAT)
+        currentStatus = "Depositing Surplus"
+        for i = 1, 10 do
+            if turtle.getItemCount(i) > 0 then
+                turtle.select(i)
+                local item = turtle.getItemDetail()
+                -- Only drop the item if it is NOT wheat
+                if item and item.name ~= "minecraft:wheat" then
+                    turtle.dropDown()
+                end
+            end
+        end
+        turtle.select(1)
+
+        if stopRequested or lowFuelTriggered then break end
+        
+        currentStatus = "Waiting for Crops..."
+        sleep(600) -- 10 minute rest between growth cycles
+    end
+end
+
+local function getBirchSaplingCount()
+    local count = 0
+    -- Check slots 1-15 (Slot 16 is reserved for the Ender Chest)
+    for i = 1, 15 do
+        local item = turtle.getItemDetail(i)
+        if item and item.name == "minecraft:birch_sapling" then
+            count = count + turtle.getItemCount(i)
+        end
+    end
+    return count
+end
+
+local function executeBirchFarmTask()
+    if not isFacingCalibrated then calibrateFacing() end
+    local startX, startY, startZ = getPosition()
+    if not startX then currentStatus = "Error: No GPS" return end
+    if not homeX then saveHome(startX, startY, startZ) end
+
+    local minX = math.floor(startX / 16) * 16
+    local minZ = math.floor(startZ / 16) * 16
+    local farmY = homeY + 1
+
+    local treeXList = { minX + 2, minX + 5, minX + 8, minX + 11, minX + 14 }
+    local treeZList = { minZ + 2, minZ + 5, minZ + 8, minZ + 11, minZ + 14 }
+    local REQUIRED_SAPLINGS = 1
+
+    -- ==========================================
+    -- INITIAL BOOT CHECK & INVENTORY ORGANIZER
+    -- ==========================================
+    local function checkAndOrganizeEquipment()
+        -- Edge Case: Auto-swap tool back if turtle was halted mid-crafting loop
+        local item15 = turtle.getItemDetail(15)
+        if item15 and item15.name:find("pickaxe") then
+            turtle.select(15)
+            turtle.equipRight()
+        end
+
+        -- 1. Consolidate Saplings into Slot 13
+        for i = 1, 16 do
+            if i ~= 13 and i ~= 14 and i ~= 15 then
+                local item = turtle.getItemDetail(i)
+                if item and item.name == "minecraft:birch_sapling" then
+                    turtle.select(i)
+                    turtle.transferTo(13)
+                end
+            end
+        end
+
+        -- 2. Move Chest or Barrel into Slot 14 (Excluding Ender Chests)
+        local item14 = turtle.getItemDetail(14)
+        local isBufferChest = function(name)
+            return (name:find("chest") and not name:find("ender")) or name:find("barrel")
+        end
+
+        if not (item14 and isBufferChest(item14.name)) then
+            for i = 1, 16 do
+                if i ~= 13 and i ~= 14 and i ~= 15 then
+                    local item = turtle.getItemDetail(i)
+                    if item and isBufferChest(item.name) then
+                        turtle.select(i)
+                        turtle.transferTo(14)
+                        break
+                    end
+                end
+            end
+        end
+
+        -- 3. Move Crafting Table into Slot 15 if misplaced
+        local item15Check = turtle.getItemDetail(15)
+        if not (item15Check and item15Check.name == "minecraft:crafting_table") then
+            for i = 1, 16 do
+                if i ~= 13 and i ~= 14 and i ~= 15 then
+                    local item = turtle.getItemDetail(i)
+                    if item and item.name == "minecraft:crafting_table" then
+                        turtle.select(i)
+                        turtle.transferTo(15)
+                        break
+                    end
+                end
+            end
+        end
+
+        -- 4. Verify presence in designated slots
+        local saplingItem = turtle.getItemDetail(13)
+        local saplingCount = (saplingItem and saplingItem.name == "minecraft:birch_sapling") and saplingItem.count or 0
+
+        local chestItem = turtle.getItemDetail(14)
+        local hasChest = chestItem and isBufferChest(chestItem.name)
+
+        local craftItem = turtle.getItemDetail(15)
+        local hasCraftingTable = craftItem and craftItem.name == "minecraft:crafting_table"
+
+        turtle.select(1)
+
+        -- 5. Return status check and missing item notice
+        if saplingCount < REQUIRED_SAPLINGS then
+            return false, "Need Saplings: " .. saplingCount .. "/" .. REQUIRED_SAPLINGS .. " (S13)"
+        elseif not hasChest then
+            return false, "Need Chest in Slot 14"
+        elseif not hasCraftingTable then
+            return false, "Need Crafting Table (S15)"
+        end
+
+        return true, "OK"
+    end
+
+    -- Run the boot loop until all items are present and organized
+    while not stopRequested do
+        local isReady, statusMsg = checkAndOrganizeEquipment()
+        if isReady then break end
+        currentStatus = statusMsg
+        sleep(5)
+    end
+
+    while not stopRequested do
+        currentStatus = "Farming Birch"
+        local forwardZ = true
+
+        for _, targetX in ipairs(treeXList) do
+            if stopRequested or lowFuelTriggered then break end
+
+            local zIndices = {}
+            if forwardZ then
+                for i = 1, #treeZList do table.insert(zIndices, i) end
+            else
+                for i = #treeZList, 1, -1 do table.insert(zIndices, i) end
+            end
+
+            for _, zIdx in ipairs(zIndices) do
+                local targetZ = treeZList[zIdx]
+
+                if stopRequested or lowFuelTriggered then break end
+                if not checkFuelSafety() then
+                    lowFuelTriggered = true
+                    currentStatus = "Low Fuel! Ret. Home"
+                    break
+                end
+
+                goTo(targetX, farmY, targetZ)
+
+                local hasDown, downData = turtle.inspectDown()
+                local hasUp, upData = turtle.inspectUp()
+                
+                local isTreeDown = hasDown and (downData.name == "minecraft:birch_log" or downData.name == "minecraft:log")
+                local isTreeUp = hasUp and (upData.name == "minecraft:birch_log" or upData.name == "minecraft:birch_leaves" or upData.name == "minecraft:log")
+
+                if isTreeDown or isTreeUp then
+                    if isTreeDown then turtle.digDown() end
+                    
+                    while true do
+                        local uExists, uData = turtle.inspectUp()
+                        if uExists and (uData.name == "minecraft:birch_log" or uData.name == "minecraft:birch_leaves" or uData.name == "minecraft:log") then
+                            turtle.digUp()
+                            safeUp()
+                        else
+                            break
+                        end
+                    end
+                    goTo(targetX, farmY, targetZ)
+                end
+
+                local hasD, dData = turtle.inspectDown()
+                if not hasD or (dData.name ~= "minecraft:birch_sapling" and dData.name ~= "minecraft:birch_log" and dData.name ~= "minecraft:log") then
+                    for i = 1, 14 do
+                        local item = turtle.getItemDetail(i)
+                        if item and item.name == "minecraft:birch_sapling" then
+                            turtle.select(i)
+                            turtle.placeDown()
+                            turtle.select(1)
+                            break
+                        end
+                    end
+                end
+            end
+            forwardZ = not forwardZ
+        end
+
+        if stopRequested or lowFuelTriggered then break end
+
+        -- Return to Home Position
+        currentStatus = "Returning Home"
+        goTo(homeX, farmY, homeZ)
+        goTo(homeX, homeY, homeZ)
+        turnTo(0)
+
+        -- ==========================================
+        -- CRAFTING, REFUELING & DEPOSIT LOGIC
+        -- ==========================================
+        currentStatus = "Crafting Planks"
+
+        -- 1. Place Chest/Barrel from slot 14 above the turtle
+        turtle.select(14)
+        turtle.placeUp()
+
+        -- 2. Equip the Crafting Table from slot 15 to the right side (Pickaxe goes to 15)
+        turtle.select(15)
+        turtle.equipRight()
+
+        -- Store exact names of the Tool and Ender Chest so we can catch them later
+        local toolItem = turtle.getItemDetail(15)
+        local savedToolName = toolItem and toolItem.name or ""
+        
+        local enderItem = turtle.getItemDetail(16)
+        local savedEnderName = enderItem and enderItem.name or ""
+
+        -- 3. Empty ALL 16 slots UP into the buffer chest to guarantee a clean inventory
+        for i = 1, 16 do
+            if turtle.getItemCount(i) > 0 then
+                turtle.select(i)
+                turtle.dropUp()
+            end
+        end
+
+        -- 4. Process items stack-by-stack from the chest above
+        currentStatus = "Processing Items"
+        turtle.select(1)
+        
+        while turtle.suckUp() do
+            local item = turtle.getItemDetail(1)
+            if item then
+                if item.name == "minecraft:birch_log" or item.name == "minecraft:log" then
+                    -- Select slot 8 so crafted planks output there instead of jamming the slot 1 grid
+                    turtle.select(8)
+                    turtle.craft()
+                    
+                    for i = 1, 16 do
+                        local pItem = turtle.getItemDetail(i)
+                        if pItem and (pItem.name == "minecraft:birch_planks" or pItem.name == "minecraft:planks") then
+                            turtle.select(i)
+                            while turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() < 500 and turtle.getItemCount(i) > 0 do
+                                turtle.refuel(1) 
+                            end
+                            if turtle.getItemCount(i) > 0 then
+                                turtle.dropDown()
+                            end
+                        end
+                    end
+                    
+                    if turtle.getItemCount(1) > 0 then
+                        turtle.select(1)
+                        turtle.dropDown()
+                    end
+                    turtle.select(1)
+                    
+                elseif savedToolName ~= "" and item.name == savedToolName then
+                    -- Catch the tool and place it directly back into slot 15
+                    turtle.transferTo(15)
+                    turtle.select(1)
+                    
+                elseif savedEnderName ~= "" and item.name == savedEnderName then
+                    -- Catch the Ender Chest and place it directly back into slot 16
+                    turtle.transferTo(16)
+                    turtle.select(1)
+                    
+                else
+                    -- Buffer Saplings and Apples in slots 2-12
+                    for s = 2, 12 do
+                        if turtle.getItemCount(s) == 0 or (turtle.getItemDetail(s).name == item.name and turtle.getItemCount(s) < 64) then
+                            turtle.transferTo(s)
+                            if turtle.getItemCount(1) == 0 then break end
+                        end
+                    end
+                    if turtle.getItemCount(1) > 0 then
+                        turtle.dropDown()
+                    end
+                    turtle.select(1)
+                end
+            end
+        end
+
+        -- 5. Re-equip Pickaxe (Crafting Table returns to 15)
+        turtle.select(15)
+        turtle.equipRight()
+
+        -- 6. Mine the now-empty barrel/chest from above
+        turtle.select(14)
+        turtle.digUp()
+
+        -- 7. Organize designated items back into their correct slots
+        currentStatus = "Organizing Slots"
+        
+        -- Ensure Saplings go exactly to Slot 13
+        for i = 1, 14 do
+            if i ~= 13 then
+                local item = turtle.getItemDetail(i)
+                if item and item.name == "minecraft:birch_sapling" then
+                    turtle.select(i)
+                    turtle.transferTo(13)
+                end
+            end
+        end
+        
+        -- Ensure Barrel/Chest goes exactly to Slot 14
+        local cItem = turtle.getItemDetail(14)
+        if not (cItem and (cItem.name:find("chest") or cItem.name:find("barrel"))) then
+            for i = 1, 14 do
+                if i ~= 14 then
+                    local item = turtle.getItemDetail(i)
+                    if item and (item.name:find("chest") or item.name:find("barrel")) and not item.name:find("ender") then
+                        turtle.select(i)
+                        turtle.transferTo(14)
+                        break
+                    end
+                end
+            end
+        end
+
+        -- 8. Dump all surplus items into the bottom chest
+        currentStatus = "Depositing Surplus"
+        for i = 1, 12 do
+            if turtle.getItemCount(i) > 0 then
+                turtle.select(i)
+                turtle.dropDown()
+            end
+        end
+        turtle.select(1)
+
+        if stopRequested or lowFuelTriggered then break end
+        
+        currentStatus = "Waiting for Trees..."
+        sleep(300)
+    end
+end
+
+local function executeMiningTask(task)
+    local mode = type(task) == "table" and (task.mode or task.ore) or task
+    local topY = type(task) == "table" and task.topY or 48
+    local bottomY = type(task) == "table" and task.bottomY or -58
+    local strategy = type(task) == "table" and task.strategy or "ore"
+
+    if mode == "Chosen Chunk" then
+        executeChosenChunkMiningTask(topY, bottomY, strategy)
+    elseif mode == "Chunk Strip" then
+        executeChosenChunkMiningTask(48, -58, "ore")
+    elseif mode == "Birch Farm" then
+        executeBirchFarmTask()
+    elseif mode == "Wheat Farm" then
+        executeWheatFarmTask()
+    else
+        executeChosenChunkMiningTask(48, -58, "ore")
+    end
+end
+
+local function sendHeartbeat()
+    while true do
+        checkVersionState()
+
+        local x, y, z = getPosition()
+        local fuel, maxFuel = turtle.getFuelLevel(), turtle.getFuelLimit()
+        local distHome = (x and homeX and homeY and homeZ) and math.floor(math.abs(x - homeX) + math.abs(y - homeY) + math.abs(z - homeZ)) or nil
+
+        rednet.broadcast({
+            id = os.getComputerID(),
+            name = os.getComputerLabel() or ("Turtle #" .. os.getComputerID()),
+            status = currentStatus,
+            fuel = fuel,
+            maxFuel = maxFuel,
+            version = CLIENT_VERSION,
+            x = x, y = y, z = z,
+            facingName = facingNames[currentFacing] or "North",
+            freeSlots = getFreeInventorySlots(),
+            hasEnderChest = isEnderChest(REQUIRED_SLOT),
+            homeX = homeX, homeY = homeY, homeZ = homeZ,
+            distToHome = distHome,
+            timestamp = os.epoch("utc")
+        }, PROTOCOL)
+        sleep(2)
+    end
+end
+
+local function commandListener()
+    while true do
+        local senderID, msg = rednet.receive(PROTOCOL)
+        if type(msg) == "table" then
+            if msg.masterVersion then
+                latestMasterVersion = msg.masterVersion
+            end
+
+            if msg.type == "version_sync" or msg.type == "master_ping" then
+                if msg.version then latestMasterVersion = msg.version end
+            elseif msg.type == "start_mining" then
+                stopRequested = false
+                pendingTask = { 
+                    type = "mine", 
+                    mode = msg.mode or msg.ore, 
+                    topY = msg.topY, 
+                    bottomY = msg.bottomY, 
+                    strategy = msg.strategy 
+                }
+            elseif msg.type == "go_home" then
+                stopRequested = true
+                pendingTask = { type = "home" }
+            elseif msg.type == "deposit" then
+                stopRequested = true
+                pendingTask = { type = "deposit" }
+            elseif msg.type == "refuel" then
+                stopRequested = true
+                pendingTask = { type = "refuel" }
+            elseif msg.type == "set_home" then
+                local x, y, z = getPosition()
+                if x then saveHome(x, y, z) end
+            elseif msg.type == "manual_cmd" and msg.action then
+                stopRequested = true
+                pendingTask = { type = "manual", action = msg.action }
+            elseif msg.type == "rename" and msg.newName then
+                os.setComputerLabel(msg.newName)
+            elseif msg.type == "update_client" and msg.code then
+                local f = fs.open(shell.getRunningProgram(), "w")
+                if f then
+                    f.write(msg.code) f.close()
+                    rednet.send(senderID, { type = "update_response", success = true, message = "Updated! Rebooting..." }, PROTOCOL)
+                    sleep(1) os.reboot()
+                end
+            end
+        end
+    end
+end
+
+local function taskRunner()
+    while true do
+        if pendingTask then
+            local task = pendingTask
+            pendingTask = nil
+
+            tryRefuel()
+            if isFuelCriticallyLow() and isAtHome() and task.type ~= "refuel" and task.type ~= "deposit" then
+                currentStatus = "Low Fuel - Movement Locked"
+                print("Fuel <= 0.5%. Refusing movement until refueled.")
+            else
+                if task.type == "mine" then
+                    isMiningTask = true
+                    pathHistory = {}
+                    recordPosition()
+                    executeMiningTask(task)
+                    returnHomeSequence(true)
+                    isMiningTask = false
+                elseif task.type == "home" then
+                    returnHomeSequence(isMiningTask)
+                elseif task.type == "deposit" then
+                    currentStatus = "Depositing Items"
+                    depositInventory()
+                    currentStatus = "Idle"
+                    checkVersionState()
+                elseif task.type == "refuel" then
+                    currentStatus = "Refueling"
+                    refuelAll()
+                    currentStatus = "Idle"
+                    checkVersionState()
+                    if loadMiningState() and not isFuelCriticallyLow() then
+                        pendingTask = { type = "mine", mode = "Chosen Chunk" }
+                    end
+                elseif task.type == "manual" then
+                    stopRequested = false
+                    currentStatus = "Manual Drive"
+                    if task.action == "forward" then safeForward()
+                    elseif task.action == "back" then safeBack()
+                    elseif task.action == "turnLeft" then turtle.turnLeft() currentFacing = (currentFacing - 1) % 4
+                    elseif task.action == "turnRight" then turtle.turnRight() currentFacing = (currentFacing + 1) % 4
+                    elseif task.action == "up" then safeUp()
+                    elseif task.action == "down" then safeDown()
+                    elseif task.action == "dig" then turtle.dig()
+                    elseif task.action == "place" then turtle.place() end
+                    sleep(0.1)
+                    currentStatus = "Idle"
+                    checkVersionState()
+                end
+            end
+        end
+        sleep(0.1)
+    end
+end
+
+term.clear() term.setCursorPos(1, 1)
+print("Turtle Client " .. CLIENT_VERSION .. " Online.")
+loadHome()
+ensureEnderChestInSlot16()
+
+parallel.waitForAny(sendHeartbeat, commandListener, taskRunner)
